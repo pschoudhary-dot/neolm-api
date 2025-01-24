@@ -1,11 +1,12 @@
 import os
+import re
+import asyncio
 import logging
 from typing import List
 from pydantic import BaseModel
 import hashlib
 from urllib.parse import urlparse
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
@@ -34,7 +35,7 @@ class Config:
         'url': ['url']
     }
     EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-    LLM_MODEL = "llama-3.3-70b-versatile"
+    LLM_MODEL = "llama3-70b-8192"
     WHISPER_MODEL = "openai/whisper-large-v3-turbo"
     CHUNK_SIZE = 1000
     CHUNK_OVERLAP = 200
@@ -80,15 +81,13 @@ class AudioProcessor(FileProcessor):
         text = pipe(file_path)["text"]
 
         sha_hash = hashlib.sha256(text.encode()).hexdigest()
-        metadata = DocumentMetadata(
+        return DocumentMetadata(
             user_id=self.user_id,
             doc_type="audio",
             doc_name=os.path.basename(file_path),
             processed_text=text,
             sha_hash=sha_hash
         )
-        self._save_metadata(metadata)
-        return metadata
 
 
 class VideoProcessor(AudioProcessor):
@@ -116,15 +115,13 @@ class ImageProcessor(FileProcessor):
         text = processor.decode(out[0], skip_special_tokens=True)
 
         sha_hash = hashlib.sha256(text.encode()).hexdigest()
-        metadata = DocumentMetadata(
+        return DocumentMetadata(
             user_id=self.user_id,
             doc_type="image",
             doc_name=os.path.basename(file_path),
             processed_text=text,
             sha_hash=sha_hash
         )
-        self._save_metadata(metadata)
-        return metadata
 
 
 class DocumentProcessor(FileProcessor):
@@ -163,45 +160,77 @@ class DocumentProcessor(FileProcessor):
 
         text = text.encode('utf-8', 'replace').decode('utf-8')
         sha_hash = hashlib.sha256(text.encode()).hexdigest()
-        metadata = DocumentMetadata(
+        return DocumentMetadata(
             user_id=self.user_id,
             doc_type="document",
             doc_name=os.path.basename(file_path),
             processed_text=text,
             sha_hash=sha_hash
         )
-        self._save_metadata(metadata)
-        return metadata
 
 
 class URLProcessor(FileProcessor):
-    def process_file(self, url: str) -> DocumentMetadata:
-        from crawl4ai import WebCrawler
-        crawler = WebCrawler()
+    async def process_file_async(self, url: str) -> DocumentMetadata:
+        from crawl4ai import AsyncWebCrawler
+
         try:
-            result = crawler.warmup().run(url)
-            if not result:
-                raise ValueError("Empty response from crawler")
+            async with AsyncWebCrawler(
+                    browser_config={
+                        "headless": True,
+                        "user_agent": "Mozilla/5.0 (compatible; MyCrawler/1.0)",
+                        "timeout": 30
+                    }
+            ) as crawler:
+                result = await crawler.arun(
+                    url=url,
+                    run_config={
+                        "cache_mode": "bypass",
+                        "extraction_strategy": "auto",
+                        "js_code": [
+                            "window.scrollTo(0, document.body.scrollHeight)",
+                            "new Promise(resolve => setTimeout(resolve, 2000))"
+                        ]
+                    }
+                )
 
-            text = result.markdown or result.text or result.html or ""
-            text = text.encode('utf-8', 'replace').decode('utf-8')
+                if not result.cleaned_text:
+                    raise ValueError("No meaningful content extracted")
 
-            if not text:
-                raise ValueError(f"Failed to extract content from URL: {url}")
+                text = self._clean_content(result.cleaned_text)
+                metadata = self._create_metadata(text, url)
+                self._save_metadata(metadata)
+                return metadata
 
-            sha_hash = hashlib.sha256(text.encode()).hexdigest()
-            metadata = DocumentMetadata(
-                user_id=self.user_id,
-                doc_type="url",
-                doc_name=url,
-                processed_text=text,
-                sha_hash=sha_hash
-            )
-            self._save_metadata(metadata)
-            return metadata
         except Exception as e:
             logger.error(f"Web crawling error: {str(e)}")
             raise
+
+    def _clean_content(self, text: str) -> str:
+        patterns = [
+            r'<script\b[^>]*>.*?</script>',
+            r'<style\b[^>]*>.*?</style>',
+            r'\bAdvertisement\b.*?\n',
+            r'\s{2,}',
+            r'\[.*?\]'
+        ]
+        for pattern in patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        return ' '.join(text.split()[:2000])
+
+    def _create_metadata(self, text: str, url: str) -> DocumentMetadata:
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace('www.', '').split('.')[0].title()
+        sha_hash = hashlib.sha256(text.encode()).hexdigest()
+        return DocumentMetadata(
+            user_id=self.user_id,
+            doc_type="url",
+            doc_name=f"{domain}_content",
+            processed_text=text,
+            sha_hash=sha_hash
+        )
+
+    def process_file(self, url: str) -> DocumentMetadata:
+        return asyncio.run(self.process_file_async(url))
 
 
 # --- Processing Pipeline ---
@@ -215,16 +244,20 @@ def process_file(file_path: str, user_id: str) -> DocumentMetadata:
     except:
         ext = 'url'
 
+    processor_map = {
+        'audio': AudioProcessor,
+        'video': VideoProcessor,
+        'image': ImageProcessor,
+        'doc': DocumentProcessor,
+        'url': URLProcessor
+    }
+
     for file_type, exts in Config.SUPPORTED_TYPES.items():
         if ext in exts or (file_type == 'url' and ext == 'url'):
-            processor_class = {
-                'audio': AudioProcessor,
-                'video': VideoProcessor,
-                'image': ImageProcessor,
-                'doc': DocumentProcessor,
-                'url': URLProcessor
-            }[file_type]
-            return processor_class(user_id).process_file(file_path)
+            processor = processor_map[file_type](user_id)
+            metadata = processor.process_file(file_path)
+            processor._save_metadata(metadata)
+            return metadata
 
     raise ValueError(f"Unsupported file type: {ext}")
 
@@ -239,27 +272,21 @@ class VectorStoreManager:
         )
         self.vector_store = Chroma(
             persist_directory=Config.CHROMA_DIR,
-            embedding_function=self.embedding,
-            collection_metadata={"hnsw:space": "cosine"}
+            embedding_function=self.embedding
         )
-        # Replace RecursiveCharacterTextSplitter with SemanticChunker
-        self.text_splitter = SemanticChunker(
-            self.embedding,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=95.0
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=Config.CHUNK_SIZE,
+            chunk_overlap=Config.CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " "]
         )
 
     def add_documents(self, documents: List[DocumentMetadata]):
-        texts = [doc.processed_text for doc in documents]
-        metadatas = [doc.model_dump() for doc in documents]
-
         chunks = []
-        # Process each text with its corresponding metadata
-        for text, metadata in zip(texts, metadatas):
-            doc_chunks = self.text_splitter.create_documents([text])
-            # Assign metadata to each chunk
-            for chunk in doc_chunks:
-                chunk.metadata = metadata
+        for doc in documents:
+            doc_chunks = self.text_splitter.create_documents(
+                [doc.processed_text],
+                [doc.model_dump()]
+            )
             chunks.extend(doc_chunks)
 
         self.vector_store.add_documents(chunks)
@@ -267,30 +294,28 @@ class VectorStoreManager:
 
     def get_retriever(self):
         return self.vector_store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 5}  # Removed score_threshold
+            search_type="mmr",
+            search_kwargs={"k": 5, "score_threshold": 0.7}
         )
 
 
 # --- Chat Interface ---
 class ChatManager:
     def __init__(self):
-        groq_api_key = os.getenv("GROQ_API_KEY")
         self.llm = ChatGroq(
             temperature=0.3,
             model_name=Config.LLM_MODEL,
-            api_key=groq_api_key
+            api_key=os.getenv("GROQ_API_KEY")
         )
         self.vector_store = VectorStoreManager()
 
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """Answer the following question based only on the provided context.
-                Think step by step before providing a detailed answer.
-                I will tip you $1000 if the user finds the answer helpful.
+            ("system", """you are very helpful and intelligent assistant help the user using context. Follow these rules:
+            1. For authorship questions, check 'doc_name' and text content
+            2. If unsure, state "Information not found in documents"
+            3. Always cite sources using format: [Source: doc_name]
 
-            <Context>
-                {context}
-            </Context>
+            Context: {context}
 
             Question: {input}
             Answer:""")
@@ -307,7 +332,7 @@ class ChatManager:
             response = self.retrieval_chain.invoke({"input": question})
             answer = response["answer"]
             sources = list({doc.metadata['doc_name'] for doc in response["context"]})
-            return f"{answer}\n\nSources: {sources}"
+            return f"{answer}\n\nSources: {', '.join(sources)}"
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
             return "Sorry, I encountered an error processing your request."
@@ -338,7 +363,6 @@ def main():
 
     vector_mgr.add_documents(processed_docs)
 
-    # Chat interface
     while True:
         question = input("\nAsk a question (q to quit): ")
         if question.lower() == 'q':
