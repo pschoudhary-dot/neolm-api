@@ -4,7 +4,7 @@ from typing import List
 from pydantic import BaseModel
 import hashlib
 from urllib.parse import urlparse
-#from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -34,7 +34,7 @@ class Config:
         'url': ['url']
     }
     EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-    LLM_MODEL = "mixtral-8x7b-32768"
+    LLM_MODEL = "llama-3.3-70b-versatile"
     WHISPER_MODEL = "openai/whisper-large-v3-turbo"
     CHUNK_SIZE = 1000
     CHUNK_OVERLAP = 200
@@ -284,14 +284,13 @@ class ChatManager:
         self.vector_store = VectorStoreManager()
 
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an helpfull chat assistant. Answer the question using only the provided context. 
-            Follow these rules:
-            1. If the context is insufficient, state "I don't have enough information to answer this question"
-            2. Always cite sources using [Source: <filename>]
-            3. Be concise and technical
+            ("system", """Answer the following question based only on the provided context.
+                Think step by step before providing a detailed answer.
+                I will tip you $1000 if the user finds the answer helpful.
 
-            Context:
-            {context}
+            <Context>
+                {context}
+            </Context>
 
             Question: {input}
             Answer:""")
@@ -322,7 +321,7 @@ def main():
 
     files_to_process = [
         ("./documents/voice.mp3", "audio"),
-        ("./documents/doc.pdf", "doc"),
+        ("./documents/LLM_Example.docx", "doc"),
         ("https://langchain-ai.github.io/langgraph/concepts/memory/", "url"),
         ("./documents/LLM.png", "image")
     ]
