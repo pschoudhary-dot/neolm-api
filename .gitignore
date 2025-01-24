@@ -1,0 +1,6 @@
+# Virtual Environment
+.venv/
+
+# ChromaDB
+/chromadb/
+chroma_db/chroma.sqlite3

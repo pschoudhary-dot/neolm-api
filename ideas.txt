@@ -1,0 +1,17 @@
+Multi-Modal Support:
+
+Text: Sentence Transformers
+
+Images: OpenCLIP
+
+Audio: CLAP model
+
+URLs: Automatic content type detection
+
+# Process files
+    files_to_process = [
+        ("./documents/voice.mp3", "audio"),
+        ("./documents/LLM_Example.docx", "doc"),
+        ("https://langchain-ai.github.io/langgraph/concepts/memory/", "url"),
+        ("./documents/LLM.png", "image")
+    ]
